@@ -1,267 +1,198 @@
 **DO NOT READ THIS FILE ON GITHUB, GUIDES ARE PUBLISHED ON https://guides.rubyonrails.org.**
 
-Tuning Performance for Deployment
+デプロイ時のパフォーマンスチューニング
 =================================
 
-This guide covers performance and concurrency configuration for deploying your production Ruby on Rails application.
+このガイドでは、Ruby on Rails アプリケーションをproduction環境にデプロイする際のパフォーマンスとコンカレンシー（並行処理）の設定について説明します。
 
-After reading this guide, you will know:
+このガイドの内容:
 
-* Whether to use Puma, the default application server
-* How to configure important performance settings for Puma
-* How to begin performance testing your application settings
+* Puma（Railsデフォルトのアプリケーションサーバー）を利用すべきかどうか
+* Pumaの重要なパフォーマンス項目の設定方法
+* アプリケーション設定のパフォーマンステストを始める方法
 
-This guide focuses on web servers, which are the primary performance-sensitive component of most web applications. Other
-components like background jobs and WebSockets can be tuned but won't be covered by this guide.
+このガイドは、多くのWebアプリケーションにおいてパフォーマンスに敏感なコンポーネントであるWebサーバーに焦点を当てています。バックグラウンドジョブやWebSocketsなどの他のコンポーネントもチューニング可能ですが、このガイドでは扱いません。
 
-More information about how to configure your application can be found in the [Configuration Guide](configuring.html).
+
+アプリケーションの設定方法について詳しくは、[Rails アプリケーションの設定項目](configuring.html)ガイドを参照してください。
 
 --------------------------------------------------------------------------------
 
-This guide assumes you are running [MRI](https://ruby-lang.org), the canonical implementation of Ruby also known as
-CRuby. If you're using another Ruby implementation such as JRuby or TruffleRuby, most of this guide doesn't apply.
-If needed, check sources specific to your Ruby implementation.
+このガイドでは、[Ruby](https://ruby-lang.org)言語の標準実装であるMRI（CRubyとも呼ばれます）を実行していることを前提とします。JRubyやTruffleRubyなど他のRuby実装を利用する場合、このガイドのほとんどは適用外です。必要に応じて、それらのRuby実装に固有の情報源を確認してください。
 
-Choosing an Application Server
+アプリケーションサーバーを選定する
 ------------------------------
 
-Puma is Rails' default application server and the most commonly used server across the community.
-It works well in most cases. In some cases, you may wish to change to another.
+Pumaは、Railsのデフォルトのアプリケーションサーバーであり、コミュニティ全体で最も一般に使われているWebサーバーです。ほとんどの場合Pumaで問題なく動作しますが、状況によっては別のサーバーに変更したい場合があります。
 
-An application server uses a particular concurrency method.
-For example, Unicorn uses processes, Puma and Passenger are hybrid process- and thread-based concurrency, and Falcon
-uses fibers.
+アプリケーションサーバーは、独自のコンカレンシー処理方法を採用しています。たとえば、UnicornというWebサーバーはプロセスを利用しますが、PumaやPassengerのコンカレンシー処理はプロセスとスレッドのハイブリッドベースであり、Falconはファイバー（fiber）を利用します。
 
-A full discussion of Ruby's concurrency methods is beyond the scope of this document, but the key tradeoffs between
-processes and threads will be presented.
-If you want to use a method other than processes and threads, you will need to use a different application server.
+Rubyのコンカレンシー処理方法の詳しい説明はこのガイドの範囲外ですが、プロセスとスレッド間の重要なトレードオフについて説明します。プロセスとスレッド以外の方法を利用する場合は、別のアプリケーションサーバーを使用する必要があります。
 
-This guide will focus on how to tune Puma.
+このガイドでは、Pumaのチューニング方法を中心に解説します。
 
-What to Optimize for?
+どの項目を最適化すべきか
 ------------------------------
 
-In essence, tuning a Ruby web server is making a tradeoff between multiple properties such as memory usage, throughput,
-and latency.
+Ruby製Webサーバーのチューニングは、本質的に「メモリ使用量」「スループット」「レイテンシ」などのさまざまなプロパティの間でトレードオフを行うことです。
 
-The throughput is the measure of how many requests per second the server can handle, and latency is the measure of how
-long individual requests take (also referred to as response time).
+スループット（throughtput）は、サーバーが1秒あたりに処理可能なリクエスト数の指標であり、レイテンシ（latency）は、個々のリクエストの処理に要する時間（応答時間とも呼ばれます）の指標です。
 
-Some users may want to maximize throughput to keep their hosting cost low, some other users may want to minimize latency
-to offer the best user experience, and many users will search for some compromise somewhere in the middle.
+ホスティングコストを低く抑えるためにスループットを最大化したいユーザーもいれば、最高のユーザーエクスペリエンスを提供するためにレイテンシを最小化したいユーザーもいます。多くのユーザーは、両者の中間のどこかで妥協点を探ります。
 
-It is important to understand that optimizing for one property will generally hurt at least another one.
+重要なのは、あるプロパティを最適化すれば、少なくともそれと引き換えに別のプロパティが損なわれることを理解しておくことです。
 
-### Understanding Ruby's Concurrency and Parallelism
+### Rubyのコンカレンシーとパラレリズムを理解する
 
-[CRuby](https://www.ruby-lang.org/en/) has a [Global Interpreter Lock](https://en.wikipedia.org/wiki/Global_interpreter_lock),
-often called the GVL or GIL.
-The GVL prevents multiple threads from running Ruby code at the same time in a single process.
-Multiple threads can be waiting on network data, database operations, or some other non-Ruby work generally referred to
-as I/O operations, but only one can actively run Ruby code at a time.
+[CRuby](https://www.ruby-lang.org/ja/)には[グローバルインタプリタロック](https://ja.wikipedia.org/wiki/%E3%82%B0%E3%83%AD%E3%83%BC%E3%83%90%E3%83%AB%E3%82%A4%E3%83%B3%E3%82%BF%E3%83%97%E3%83%AA%E3%82%BF%E3%83%AD%E3%83%83%E3%82%AF)があり、これはGVLまたはGILとも呼ばれます（訳注: GVLはRuby 3.0からはthread_schedと名称が変わりました（[#5814](https://github.com/ruby/ruby/pull/5814)。また、GILという名称は主にPythonで使われています）。
 
-This means that thread-based concurrency allows for increased throughput by concurrently processing web requests
-whenever they do I/O operations, but may degrade latency whenever an I/O operation completes. The thread that performed
-it may have to wait before it can resume executing Ruby code.
-Similarly, Ruby's garbage collector is "stop-the-world" so when it triggers all threads have to stop.
+GVLは、1つのプロセスで複数のスレッドが同時にRubyコードを実行することを防ぎます。複数のスレッドがネットワークデータ、データベース操作、または一般にI/O操作と呼ばれるその他のRuby以外の作業を待機している可能性がありますが、Rubyコードをアクティブに実行できるのは一度に1つだけです。
 
-This also means that regardless of how many threads a Ruby process contains, it will never use more than a single CPU
-core.
+つまり、スレッドベースのコンカレンシーを採用すれば、WebリクエストがI/O操作を実行するたびに並行処理する形でスループットが向上しますが、I/O操作が完了するたびにレイテンシが低下する可能性があります。その操作を実行したスレッドは、Rubyコードの実行が再開されるまで待機しなければならない場合があります。
 
-Because of this, if your application only spends 50% of its time doing I/O operations, using more than 2 or 3 threads
-per process may severely hurt latency, and the gains in throughput will quickly hit diminishing returns.
+同様に、Rubyのガベージコレクタはいわゆる「ストップザワールド」であるため、トリガーされたときにすべてのスレッドを停止する必要があります。
 
-Generally speaking, a well-crafted Rails application that isn't suffering from slow SQL queries or N+1 problems doesn't
-spend more than 50% of its time doing I/O operations, hence is unlikely to benefit from more than 3 threads.
-However, some applications that do call third-party APIs inline may spend a very large proportion of their time doing
-I/O operations and may benefit from more threads than that.
+これは、Rubyプロセスに含まれるスレッド数に関係なく、CPUコアが1個より多く使われることはないということでもあります。
 
-The way to achieve true parallelism with Ruby is to use multiple processes. As long as there is a free CPU core, Ruby
-processes don't have to wait on one another before resuming execution after an I/O operation is complete.
-However, processes only share a fraction of their memory via [copy-on-write](https://en.wikipedia.org/wiki/Copy-on-write),
-so one additional process uses more memory than an additional thread would.
+このため、アプリケーションがI/O操作に費やす時間が50%しかない場合、プロセスごとのスレッド数が2〜3個を超えるとレイテンシが大幅に悪化し、スループットが向上するメリットがたちまち目減りしてしまう可能性があります。
 
-Note that while threads are cheaper than processes, they are not free, and increasing the number of threads per process,
-also increases memory usage.
+一般的に、きちんと作り込まれた（SQLクエリが遅くならず、N+1クエリ問題も発生していない）Railsアプリケーションであれば、I/O操作に費やす時間が50%を超えることはないため、スレッド数を3個より多くしてもメリットはほとんど得られません。 ただし、サードパーティAPIをインラインで呼び出す一部のアプリケーションでは、I/O操作に非常に多くの時間を費やす可能性があり、スレッド数を3より多くするメリットが得られる可能性もあります。
 
-### Practical Implications
+Rubyで真のパラレリズム（並列処理）を実現する方法は、複数のプロセスを利用することです。Rubyプロセスは、CPUコアが空いている限り、I/O操作の完了後に実行を再開する前に互いに待機する必要は生じません。
+ただし、プロセスは[コピーオンライト](https://ja.wikipedia.org/wiki/%E3%82%B3%E3%83%94%E3%83%BC%E3%82%AA%E3%83%B3%E3%83%A9%E3%82%A4%E3%83%88)を介してメモリの一部のみを共有するため、プロセスが1個増えると、スレッドが1個増えるよりも多くのメモリが消費されます。
 
-Users interested in optimizing for throughput and server utilization will want to run one process per CPU core and
-increase the number of threads per process until the impact on latency is dimmed too important.
+スレッドはプロセスよりも安価ですが、無料ではなく、プロセスあたりのスレッド数を増やすとメモリ使用量も増加する点にご注意ください。
 
-Users interested in optimizing for latency will want to keep the number of threads per process low.
-To optimize for latency even further, users can even set the thread per process count to `1` and run `1.5` or `1.3`
-process per CPU core to account for when processes are idle waiting for I/O operations.
+### 現場向けのアドバイス
 
-It is important to note that some hosting solutions may only offer a relatively small amount of memory (RAM) per CPU
-core, preventing you from running as many processes as needed to use all CPU cores.
-However, most hosting solutions have different plans with different ratios of memory and CPU.
+スループットとサーバーの使用率を最適化したいユーザーは、CPUコアごとに1個のプロセスを実行し、レイテンシへの影響がそれほど重要でなくなるまでプロセスあたりのスレッド数を増やす必要があります。
 
-Another thing to consider is that Ruby memory usage benefits from economies of scale thanks to
-[copy-on-write](https://en.wikipedia.org/wiki/Copy-on-write).
-So `2` servers with `32` Ruby processes each will use less memory per CPU core than `16` servers with `4` Ruby processes
-each.
+レイテンシを最適化したいユーザーは、プロセスあたりのスレッド数を低く抑える必要があります。
 
-Configurations
+レイテンシをさらに最適化するには、プロセスあたりのスレッド数を`1`に設定し、プロセスがI/O操作を待機してアイドル状態になっている場合を考慮して、CPUコアあたりの実行プロセス数を`1.5`または`1.3`にすることも可能です。
+
+一部のホスティングソリューションでは、CPUコアあたりに提供されるメモリ（RAM）が比較的少量しかない場合があり、すべてのCPUコアを利用するのに必要なプロセス数を実行できなくなることにご注意ください（ただし、ほとんどのホスティングソリューションには、メモリとCPUの比率が異なるさまざまなプランが用意されています）。
+
+もう1つ考慮しておきたい点は、Rubyのメモリ使用量が[コピーオンライト](https://ja.wikipedia.org/wiki/%E3%82%B3%E3%83%94%E3%83%BC%E3%82%AA%E3%83%B3%E3%83%A9%E3%82%A4%E3%83%88)のおかげでスケールメリットを受けられることです。
+したがって、`2`個のサーバーで`32`個ずつRubyプロセスを実行する方が、`16`個のサーバーで`4`個ずつRubyプロセスを実行するよりも、CPUコアあたりのメモリ使用量が少なく済みます。
+
+設定
 --------------
 
 ### Puma
 
-The Puma configuration resides in the `config/puma.rb` file.
-The two most important Puma configurations are the number of threads per process, and the number of processes,
-which Puma calls `workers`.
+Pumaの設定は`config/puma.rb`ファイルにあります。
+Pumaで最も重要な2つの設定は、「プロセスあたりのスレッド数」と「プロセス数」（Pumaではこれを`workers`と呼びます）です。。
 
-The number of threads per process is configured via the `thread` directive.
-In the default generated configuration, it is set to `3`.
-You can modify it either by setting the `RAILS_MAX_THREADS` environment variable or simply editing the configuration
-file.
+プロセスあたりのスレッド数は、`thread`ディレクティブで設定します。
+生成されるデフォルト設定では`3`に設定されています。
+この値は、`RAILS_MAX_THREADS`環境変数を設定するか、設定ファイルを編集するだけで変更できます。
 
-The number of processes is configured by the `workers` directive.
-If you use more than one thread per process, then it should be set to how many CPU cores are available on the server,
-or if the server is running multiple applications, to how many cores you want the application to use.
-If you only use one thread per worker, then you can increase it to above one per process to account for when workers are
-idle waiting for I/O operations.
-In the default generated configuration, it is set to use all the available processor cores on the server via the
-`Concurrent.available_processor_count` helper. You can also modify it by setting the `WEB_CONCURRENCY` environment variable.
+プロセス数は、`workers`ディレクティブで設定します。
+プロセスあたりのスレッドを複数にする場合は、サーバーで実際に利用可能なCPUコア数に設定する必要があります。
+または、サーバーで複数のアプリケーションを実行する場合は、アプリケーションが利用するコア数に設定する必要があります。
+ワーカーあたりのスレッド数が1個のみの場合は、ワーカーがI/O操作を待機してアイドル状態になっている場合を考慮して、プロセスあたりのスレッド数を1より多く増やせます。
+生成されるデフォルト設定では、`Concurrent.available_processor_count`ヘルパーを利用することで、サーバーで利用可能なすべてのプロセッサコアを使用するように設定されています。この値は、`WEB_CONCURRENCY`環境変数で変更することも可能です。
 
 ### YJIT
 
-Recent Ruby versions come with a [Just-in-time compiler](https://en.wikipedia.org/wiki/Just-in-time_compilation)
-called [`YJIT`](https://github.com/ruby/ruby/blob/master/doc/yjit/yjit.md).
+最近のRubyには[`YJIT`](https://github.com/ruby/ruby/blob/master/doc/yjit/yjit.md)と呼ばれる[Just-in-timeコンパイラ](https://ja.wikipedia.org/wiki/%E5%AE%9F%E8%A1%8C%E6%99%82%E3%82%B3%E3%83%B3%E3%83%91%E3%82%A4%E3%83%A9)が付属しています。
 
-Without going into too many details, JIT compilers allow to execute code faster, at the expense of using some more
-memory.
-Unless you really cannot spare this extra memory usage, it is highly recommended to enable YJIT.
+このガイドでは詳しく説明しませんが、JITコンパイラを有効にすることで、メモリ使用量が増加する代わりにコードをより高速に実行できます。メモリ使用量の増加分をどうしてもまかなえない場合を除いて、YJITを有効にすることを強くオススメします。
 
-As for Rails 7.2, if your application is running on Ruby 3.3 or superior, YJIT will automatically be enabled by Rails
-by default.
-Older versions of Rails or Ruby have to enable it manually, please refer to the
-[`YJIT documentation`](https://github.com/ruby/ruby/blob/master/doc/yjit/yjit.md) about how to do it.
+Rails 7.2以後は、アプリケーションがRuby3.3以上で実行されていれば、RailsによってYJITが自動的にデフォルトで有効になります。
+RailsまたはRubyのバージョンがこれより古い場合は、手動で有効にする必要があります。方法については、[`YJIT`のドキュメント](https://github.com/ruby/ruby/blob/master/doc/yjit/yjit.md)を参照してください。
 
-If the extra memory usage is a problem, before entirely disabling YJIT, you can try tuning it to use less memory via
-[the `--yjit-exec-mem-size` configuration](https://github.com/ruby/ruby/blob/master/doc/yjit/yjit.md#decreasing---yjit-exec-mem-size).
+メモリ使用量の増加が問題になる場合は、YJITを完全に無効にする前に、[`--yjit-exec-mem-size`オプション](https://github.com/ruby/ruby/blob/master/doc/yjit/yjit.md#decreasing---yjit-exec-mem-size)で、メモリ使用量を削減する調整方法を試してみてください。
 
-### Memory Allocators and Configuration
+### メモリアロケータとその設定方法
 
-Because of how the default memory allocator works on most Linux distributions, running Puma with multiple threads can
-lead to an unexpected increase in memory usage caused by [memory fragmentation](https://en.wikipedia.org/wiki/Fragmentation_\(computing\)).
-In turn, this increased memory usage may prevent your application from fully utilizing the server CPU cores.
+ほとんどのLinuxディストリビューションでは、デフォルトのメモリアロケータの動作が原因で、Pumaを複数スレッドで実行したときに[メモリの断片化](https://en.wikipedia.org/wiki/Fragmentation_(computing))によってメモリ使用量が予期せず増加する可能性があります。そうなると、メモリ使用量の増加によって、アプリケーションがサーバーのCPUコアを十分に活用できなくなる可能性があります。
 
-To alleviate this problem, it is highly recommended the configure Ruby to use an alternative memory allocator:
-[jemalloc](https://github.com/jemalloc/jemalloc).
+この問題を軽減するには、代替のメモリアロケータである[jemalloc](https://github.com/jemalloc/jemalloc)ライブラリを使うようにRubyを設定することを強くオススメします。
 
-The default Dockerfile generated by Rails already comes preconfigured to install and use `jemalloc`. But if your hosting
-solution isn't Docker based, you should look into how to install and enable jemalloc there.
+Railsによって生成されるデフォルトのDockerfileでは、既に`jemalloc`をインストールして利用するよう事前設定されています。ただし、ホスティングソリューションがDockerベースでない場合は、jemallocをインストールして有効にする方法を個別に調べる必要があります。
 
-If for some reason that isn't possible, a less efficient alternative is to configure the default allocator in a way that
-reduces memory fragmentation by setting `MALLOC_ARENA_MAX=2` in your environment.
-Note however that this might make Ruby slower, so `jemalloc` is the preferred solution.
+何らかの理由で`jemalloc`を利用できない場合は、効率は落ちるものの、環境で`MALLOC_ARENA_MAX=2`を設定することで、メモリの断片化を減らすようにデフォルトのアロケータを設定する代替手段も利用可能です。ただし、これによりRubyが遅くなる可能性もあるため、ソリューションとしては`jemalloc`が推奨されます。
 
-Performance Testing
+パフォーマンステスト
 --------------------
 
-Because every Rails application is different, and that every Rails user may want to optimize for different properties,
-it is impossible to offer a default configuration or guidelines that works best for everyone.
+Railsアプリケーションは多種多様であり、どのプロパティを最適化したいかはRailsユーザーによって異なるため、あらゆるユーザーに最適なデフォルト設定やガイドラインをフレームワークが提供することは不可能です。
 
-Hence, the best way to choose your application's settings is to measure the performance of your application, and adjust
-the configuration until it is satisfactory for your goals.
+したがって、アプリケーション設定を選択するベストな方法は、アプリケーションのパフォーマンスを測定して、目標が達成されるまで設定の調整を繰り返すことです。
 
-This can be done with a simulated production workload, or directly in production with live application traffic.
+パフォーマンス測定は、production環境の負荷を再現するシミュレーション環境で行うことも、production環境で実際のアプリケーショントラフィックを用いて直接行うことも可能です。
 
-Performance testing is a deep subject. This guide gives only simple guidelines.
+パフォーマンステストは奥が深いテーマなので、このガイドでは簡単なガイドラインを示すにとどめます。
 
-### What to Measure
+### 測定する項目の解説
 
-Throughput is the number of requests per second that your application successfully processes.
-Any good load testing program will measure it.
-A throughput is normally a single number expressed in "requests per second".
+スループットとは、アプリケーションが1秒あたりに正常に処理するリクエスト数です。
+優秀な負荷テストプログラムであればスループットを測定できます。
+スループットは、通常「1秒あたりのリクエスト数」で表された単一の数値です。
 
-Latency is the delay from the time the request is sent until its response is successfully received, generally expressed
-in milliseconds.
-Each individual request will have its own latency.
+レイテンシ（latency）とは、リクエストが送信されてからそのレスポンスが正常に受信されるまでの遅延時間のことで、通常はミリ秒単位で表されます。レイテンシはリクエストごとに異なります。
 
-[Percentile](https://en.wikipedia.org/wiki/Percentile_rank) latency gives the latency where a certain percentage of
-requests have better latency than that.
-For instance, `P90` is the 90th-percentile latency.
-The `P90` is the latency for a single load test where only 10% of requests took longer than that to process.
-The `P50` is the latency such that half your requests were slower, also called the median latency.
+[パーセンタイル（percentile）](https://en.wikipedia.org/wiki/Percentile_rank)レイテンシは、リクエストのレイテンシがその項目を上回っているレイテンシの割合を示します。
+たとえば、`P90`は90パーセンタイルのレイテンシを表します。この`P90`は、10%のリクエストのみがそれよりも長い処理時間を要した単一の負荷テストのレイテンシです。
+`P50`は、リクエストの半分が遅いレイテンシに占められていることを表し、メジアン（median: 中央値）レイテンシとも呼ばれます。
 
-"Tail latency" refers to high-percentile latencies.
-For instance, the `P99` is the latency such that only 1% of your requests were worse.
-`P99` is a tail latency.
-`P50` is not a tail latency.
+「テールレイテンシ（tail latency）」は、高パーセンタイルレイテンシを指します。
+たとえば、`P99`は、リクエストの1%のみがそれよりも悪いレイテンシです。
+`P99`はテールレイテンシですが、`P50`はテールレイテンシではありません。
 
-Generally speaking, the average latency isn't a good metric to optimize for.
-It is best to focus on median (`P50`) and tail (`P95` or `P99`) latency.
+一般的に、平均レイテンシは最適化に適した指標ではありません。
+中央値レイテンシ（`P50`）とテールレイテンシ（`P95`または`P99`）に重点を置くのが最適です。
 
-### Production Measurement
+### production環境での測定
 
-If your production environment includes more than one server, it can be a good idea to do
-[A/B testing](https://en.wikipedia.org/wiki/A/B_testing) there.
-For instance, you could run half of the servers with `3` threads per process, and the other half with `4` threads per
-process, and then use an application performance monitoring service to compare the throughput and latency of the two
-groups.
+production環境に複数のサーバーがある場合は、その環境で[A/Bテスト](https://ja.wikipedia.org/wiki/A/B%E3%83%86%E3%82%B9%E3%83%88)を実行するのがオススメです。
+たとえば、サーバーの半分を「プロセスあたり`3`スレッド」で実行し、残り半分のサーバーを「プロセスあたり`4`スレッド」で実行することで、アプリケーションパフォーマンス監視（APM: application performance monitoring）サービスを用いて2つのグループのスループットとレイテンシを比較できます。
 
-Application performance monitoring services are numerous, some are self-hosted, some are cloud solutions, and many offer
-a free tier plan.
-Recommending a particular one is beyond the scope of this guide.
+アプリケーションパフォーマンス監視サービスはさまざまなものがあり、セルフホスト型やクラウドソリューションもあり、無料プランを提供しているものも多数あります。このガイドでは、特定のサービスを推奨することはしません。
 
-### Load Testers
+### 負荷テストプログラム
 
-You will need a load testing program to make requests of your application.
-This can be a dedicated load testing program of some kind, or you can write a small application to make HTTP requests
-and track how long they take.
-You should not normally check the time in your Rails log file.
-That time is only how long Rails took to process the request. It does not include time taken by the application server.
+アプリケーションにリクエストを行う何らかの負荷テストプログラムが必要です。
+専用の負荷テストプログラムを利用することも、HTTPリクエストを行ってその所要時間をトラッキングする小さなアプリケーションを作成することも可能です。
+所要時間をRailsログファイルでチェックすることは、通常は行うべきではありません。ログでわかる時間は、Railsがリクエストを処理するのにかかった時間だけであり、アプリケーションサーバーでかかった時間は含まれません。
 
-Sending many simultaneous requests and timing them can be difficult. It is easy to introduce subtle measurement errors.
-Normally you should use a load testing program, not write your own. Many load testers are simple to use and many
-excellent load testers are free.
+多数のリクエストを同時に送信して時間を計るのは微妙な測定エラーが発生しやすいため、難しい場合があります。
+通常は、独自のプログラムを作成するよりも専用の負荷テストプログラムを使うべきです。負荷テストプログラムの多くは利用も簡単ですし、優れた負荷テスターの多くは無料で利用で行きます。
 
-### What You Can Change
+### 変更すべき箇所を見つける
 
-You can change the number of threads in your test to find the best tradeoff between throughput and latency for your
-application.
+テストのスレッド数を変更することで、アプリケーションのスループットとレイテンシの最適なトレードオフを見つけられます。
 
-Larger hosts with more memory and CPU cores will need more processes for best usage.
-You can vary the size and type of hosts from a hosting provider.
+メモリ容量やCPUコア数が多い大規模なホスト環境では、最適な利用のためにさらにプロセスが必要になります。ホスティングプロバイダが提供するホストのサイズや種別も変更できます。
 
-Increasing the number of iterations will usually give a more exact answer, but require longer for testing.
+反復回数を増やせば、多くの場合より正確な答えを得られますが、その分テストに時間がかかります。
 
-You should test on the same type of host that will run in production.
-Testing on your development machine will only tell you what settings are best for that development machine.
+テストは、production環境で実行されるのと同じ種類のホストで行う必要があります。開発マシンでテストしても、その開発マシンに最適な設定しかわかりません。
 
-### Warmup
+### ウォームアップ
 
-Your application should process a number of requests after startup that are not included in your final measurements.
-These requests are called "warmup" requests, and are usually much slower than later "steady-state" requests.
+アプリケーションの起動直後に、最終測定に含めない多数のリクエストを処理しておく必要があります。このようなリクエストは「ウォームアップ」リクエストと呼ばれ、その後の「定常状態」リクエストよりもはるかに低速になるのが普通です。
 
-Your load testing program will usually support warmup requests. You can also run it more than once and throw away the
-first set of times.
+負荷テストプログラムは、多くの場合ウォームアップリクエストをサポートしています。また、リクエストを複数回実行して最初のセットを破棄する方法も使えます。
 
-You have enough warmup requests when increasing the number does not significantly change your result.
-[The theory behind this can be complicated](https://arxiv.org/abs/1602.00602) but most common situations are
-straightforward: test several times with different amounts of warmup. See how many warmup iterations are needed before
-the results stay roughly the same.
+リクエスト回数を増やしても結果が大幅に変わらない場合は、ウォームアップリクエストが足りています。この背後に複雑な理論が潜んでいる場合もないわけではありません（[関連情報](https://arxiv.org/abs/1602.00602)）が、ほとんどの場合はシンプルです。ウォームアップの量を変えて数回テストし、結果が安定するまでに何回ウォームアップを繰り返す必要があるかを確認します。
 
-Very long warmup can be useful for testing memory fragmentation and other issues that happen only after many requests.
+非常に長いウォームアップは、メモリの断片化や、多くのリクエストの後でのみ発生するその他の問題をテストするのに有用な場合があります。
 
-### Which Requests
+### リクエストの種別
 
-Your application probably accepts many different HTTP requests.
-You should begin by load testing with just a few of them.
-You can add more kinds of requests over time.
-If a particular kind of request is too slow in your production application, you can add it to your load testing code.
+アプリケーションが受信するHTTPリクエストには、さまざまな種別があるはずです。
+最初は、そのうちのいくつかだけを使って負荷テストを実施し、時間の経過とともにリクエストの種類を増やすとよいでしょう。productionアプリケーションで特定の種類のリクエストだけが異常に遅い場合は、負荷テストコードに追加します。
 
-A synthetic workload cannot perfectly match your application's production traffic.
-It is still helpful for testing configurations.
+負荷の合算は、production環境でのアプリケーショントラフィックと完全には一致しませんが、それでも設定をテストするうえで役に立つことがあります。
 
-### What to Look For
+### チェックすべき項目
 
-Your load testing program should allow you to check latencies, including percentile and tail latencies.
+負荷テストプログラムは、「パーセンタイルレイテンシ」と「テールレイテンシ」を含むレイテンシをチェック可能なものを利用する必要があります。
 
-For different numbers of processes and threads, or different configurations in general, check the throughput and one or
-more latencies such as P50, P90, and P99.
-Increasing the threads will improve throughput up to a point, but worsen latency.
+プロセス数やスレッド数、または一般的な構成が異なる場合は、スループットと、1つ以上のレイテンシ（P50、P90、P99など）をチェックします。
+スレッド数を増やすと、スループットはある程度向上しますが、レイテンシは悪化します。
 
-Choose a tradeoff between latency and throughput based on your application's needs.
+アプリケーションのニーズに基づいて、レイテンシとスループットのトレードオフを選択しましょう。
